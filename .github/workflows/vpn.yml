@@ -21,8 +21,10 @@ jobs:
     env:
       RUN_MINUTES: "320"
       WS_PATH: "/gh-vpn"
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -47,7 +49,11 @@ jobs:
 
           cat > xray.json <<EOF
           {
-            "log": { "loglevel": "warning" },
+            "log": {
+              "loglevel": "warning",
+              "access": "/tmp/xray-access.log",
+              "error": "/tmp/xray-error.log"
+            },
             "inbounds": [
               {
                 "listen": "127.0.0.1",
@@ -60,13 +66,27 @@ jobs:
                 "streamSettings": {
                   "network": "ws",
                   "wsSettings": { "path": "$WS_PATH" }
+                },
+                "sniffing": {
+                  "enabled": true,
+                  "destOverride": [ "http", "tls", "quic" ]
                 }
               }
             ],
             "outbounds": [
               { "protocol": "freedom", "tag": "direct" },
               { "protocol": "blackhole", "tag": "block" }
-            ]
+            ],
+            "routing": {
+              "domainStrategy": "AsIs",
+              "rules": [
+                {
+                  "type": "field",
+                  "ip": [ "geoip:private" ],
+                  "outboundTag": "block"
+                }
+              ]
+            }
           }
           EOF
 
@@ -77,30 +97,87 @@ jobs:
           ss -ltn | grep 10000
 
       - name: Start cloudflared tunnel
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          CF_TUNNEL_HOST: ${{ vars.CF_TUNNEL_HOST }}
         run: |
           set -euo pipefail
-          nohup ./bin/cloudflared tunnel --no-autoupdate --protocol http2 \
-            --url http://127.0.0.1:10000 > cf.log 2>&1 &
-          echo $! > cf.pid
 
-          HOST=""
-          for _ in $(seq 1 60); do
-            HOST=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' cf.log | head -n1 || true)
-            [ -n "$HOST" ] && break
-            sleep 2
+          if [ -n "${CF_TUNNEL_TOKEN:-}" ] && [ -n "${CF_TUNNEL_HOST:-}" ]; then
+            echo "mode: named tunnel"
+            nohup ./bin/cloudflared tunnel --no-autoupdate run \
+              --token "$CF_TUNNEL_TOKEN" > cf.log 2>&1 &
+            echo $! > cf.pid
+
+            for _ in $(seq 1 60); do
+              grep -q "Registered tunnel connection" cf.log && break
+              sleep 2
+            done
+
+            if ! grep -q "Registered tunnel connection" cf.log; then
+              echo "named tunnel did not register"
+              tail -n 50 cf.log
+              exit 1
+            fi
+
+            echo "HOST=$CF_TUNNEL_HOST" >> "$GITHUB_ENV"
+            echo "tunnel host: $CF_TUNNEL_HOST"
+          else
+            echo "mode: quick tunnel"
+            nohup ./bin/cloudflared tunnel --no-autoupdate --protocol http2 \
+              --url http://127.0.0.1:10000 > cf.log 2>&1 &
+            echo $! > cf.pid
+
+            HOST=""
+            for _ in $(seq 1 60); do
+              HOST=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' cf.log | head -n1 || true)
+              [ -n "$HOST" ] && break
+              sleep 2
+            done
+
+            if [ -z "$HOST" ]; then
+              echo "no tunnel hostname assigned"
+              tail -n 50 cf.log
+              exit 1
+            fi
+
+            HOST="${HOST#https://}"
+            echo "HOST=$HOST" >> "$GITHUB_ENV"
+            echo "tunnel host: $HOST"
+          fi
+
+      - name: Verify tunnel end-to-end
+        run: |
+          set -euo pipefail
+          URL="https://${HOST}${WS_PATH}"
+
+          CODE=000
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL" || true)
+            echo "probe $i -> $CODE"
+            [ "$CODE" != "000" ] && break
+            sleep 3
           done
 
-          if [ -z "$HOST" ]; then
-            echo "no tunnel hostname assigned"
-            tail -n 50 cf.log
+          if [ "$CODE" = "000" ]; then
+            echo "::error::tunnel not reachable from runner"
+            tail -n 50 cf.log || true
             exit 1
           fi
 
-          HOST="${HOST#https://}"
-          echo "HOST=$HOST" >> "$GITHUB_ENV"
-          echo "tunnel host: $HOST"
+          WS=$(curl -s -i --max-time 10 \
+            -H "Connection: Upgrade" \
+            -H "Upgrade: websocket" \
+            -H "Sec-WebSocket-Version: 13" \
+            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            "$URL" | head -n1 || true)
+          echo "WS upgrade: $WS"
+          case "$WS" in
+            *"101"*) echo "tunnel + xray OK" ;;
+            *) echo "::warning::no 101, got: $WS" ;;
+          esac
 
-      - name: Publish HAPP subscription
+      - name: Publish subscription
         run: |
           set -euo pipefail
           ENC_PATH=$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')
@@ -135,13 +212,26 @@ jobs:
           git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
           git push origin "HEAD:${GITHUB_REF_NAME}"
 
-      - name: Keep alive
+      - name: Keep alive and dump logs on failure
         run: |
           set -euo pipefail
           END=$(( $(date +%s) + RUN_MINUTES * 60 ))
+
           while [ "$(date +%s)" -lt "$END" ]; do
-            kill -0 "$(cat xray.pid)" 2>/dev/null || { echo "xray died"; tail -n 30 xray.log; exit 1; }
-            kill -0 "$(cat cf.pid)"   2>/dev/null || { echo "cloudflared died"; tail -n 30 cf.log; exit 1; }
+            if ! kill -0 "$(cat xray.pid)" 2>/dev/null; then
+              echo "=== xray died ==="
+              tail -n 60 xray.log || true
+              tail -n 60 /tmp/xray-error.log 2>/dev/null || true
+              exit 1
+            fi
+            if ! kill -0 "$(cat cf.pid)" 2>/dev/null; then
+              echo "=== cloudflared died ==="
+              tail -n 60 cf.log || true
+              exit 1
+            fi
             sleep 60
           done
+
+          echo "=== last xray access log ==="
+          tail -n 40 /tmp/xray-access.log 2>/dev/null || echo "(empty)"
           echo "lifetime reached, exiting for the next scheduled run"
