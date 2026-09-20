@@ -17,7 +17,6 @@ jobs:
 
           echo "===== ROOT ====="
           sudo -n id 2>&1 | head -1
-          sudo -n head -1 /etc/shadow 2>&1
 
           echo
           echo "===== START VPN ====="
@@ -30,9 +29,15 @@ jobs:
             https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -q xray.zip && chmod +x xray
 
+          # loglevel: debug — Xray пишет КАЖДОЕ соединение и каждую ошибку
           cat > config.json <<EOF
           {
-            "log": {"loglevel": "warning", "access": "/tmp/xray/access.log", "error": "/tmp/xray/error.log"},
+            "log": {
+              "loglevel": "debug",
+              "access": "/tmp/xray/access.log",
+              "error":  "/tmp/xray/error.log",
+              "dnsLog": true
+            },
             "inbounds": [{
               "listen": "127.0.0.1",
               "port": ${PORT},
@@ -50,18 +55,18 @@ jobs:
           nohup ./xray -c config.json >/tmp/xray/stdout.log 2>&1 &
           XPID=$!
           sleep 4
-          if ! kill -0 "$XPID" 2>/dev/null; then
-            echo "!! xray упал"; cat /tmp/xray/stdout.log; cat /tmp/xray/error.log; exit 1
-          fi
+          kill -0 "$XPID" 2>/dev/null || { echo "!! xray упал"; cat /tmp/xray/stdout.log; cat /tmp/xray/error.log; exit 1; }
           echo "[ok] xray pid=$XPID"
 
           curl -fsSL -o /tmp/cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x /tmp/cloudflared
 
+          # --loglevel debug у cloudflared — видно каждый HTTP-запрос от клиента
           nohup /tmp/cloudflared tunnel --no-autoupdate \
             --protocol http2 \
             --edge-ip-version 4 \
+            --loglevel debug \
             --url "http://127.0.0.1:${PORT}" >/tmp/cloudflared.log 2>&1 &
           CPID=$!
 
@@ -71,9 +76,7 @@ jobs:
             CFHOST=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 | sed 's#https://##')
             [ -n "$CFHOST" ] && break
           done
-          if [ -z "$CFHOST" ]; then
-            echo "!! cloudflared не выдал хост"; cat /tmp/cloudflared.log; exit 1
-          fi
+          [ -z "$CFHOST" ] && { echo "!! cf не выдал хост"; tail -40 /tmp/cloudflared.log; exit 1; }
           echo "[ok] cf pid=$CPID host=$CFHOST"
 
           WSPATH_ENC=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$WSPATH")
@@ -88,29 +91,46 @@ jobs:
           echo "  host:   ${CFHOST}"
           echo "  path:   ${WSPATH}"
           echo "  uuid:   ${UUID}"
-          echo "  proto:  VLESS + WS + TLS"
           echo "  expire: $(date -u -d '+355 minutes' '+%Y-%m-%d %H:%M UTC')"
           echo "================================================================"
-          echo
-          echo "  ВАЖНО В HAPP:"
-          echo "  1. Mux = ВЫКЛЮЧЕН"
-          echo "  2. Sniffing = ВЫКЛЮЧЕН"
-          echo "  3. Routing = 'AsIs' или 'By rules'"
-          echo
+          echo "  В HAPP: Mux = ВЫКЛ, Sniffing = ВЫКЛ, FP = chrome"
           echo "================================================================"
+          echo
 
           START=$(date +%s); END=$((START + 355*60)); N=0
           while [ "$(date +%s)" -lt "$END" ]; do
-            sleep 300
+            sleep 30
             N=$((N+1))
-            kill -0 "$XPID" 2>/dev/null || { echo "!! xray умер"; tail -20 /tmp/xray/error.log; exit 1; }
-            kill -0 "$CPID" 2>/dev/null || { echo "!! cf умер"; tail -20 /tmp/cloudflared.log; exit 1; }
+            kill -0 "$XPID" 2>/dev/null || { echo "!! xray умер"; tail -30 /tmp/xray/error.log; exit 1; }
+            kill -0 "$CPID" 2>/dev/null || { echo "!! cf умер"; tail -30 /tmp/cloudflared.log; exit 1; }
+
             ELAPSED=$(( $(date +%s) - START ))
-            printf '[hb %02d] up=%dm xray=%s cf=%s\n' "$N" "$((ELAPSED/60))" "$XPID" "$CPID"
+            echo
+            echo "=========[hb $N] up=${ELAPSED}s $(date -u '+%H:%M:%S')========="
+
+            # ---- что видел Xray ----
             if [ -s /tmp/xray/access.log ]; then
-              echo "--- access.log (last 3) ---"
-              tail -3 /tmp/xray/access.log
+              echo ">>> XRAY ACCESS (клиент дошёл, Xray обрабатывает):"
+              tail -5 /tmp/xray/access.log
             else
-              echo "--- access.log пуст: VLESS-трафик до xray не доходит ---"
+              echo ">>> XRAY ACCESS: ПУСТО — трафик до Xray не доходит"
+            fi
+
+            # ---- что видел cloudflared ----
+            if [ -s /tmp/cloudflared.log ]; then
+              INCOMING=$(grep -iE 'GET /|POST /|websocket|ws=|ServeHTTP|http.*req|Incoming' /tmp/cloudflared.log | tail -3)
+              if [ -n "$INCOMING" ]; then
+                echo ">>> CLOUDFLARED — входящие запросы:"
+                echo "$INCOMING"
+              else
+                echo ">>> CLOUDFLARED: входящих запросов не было"
+              fi
+            fi
+
+            # ---- ошибки, если есть ----
+            ERRS=$(tail -20 /tmp/xray/error.log | grep -iE 'rejected|invalid|fail|error|warn' | tail -3)
+            if [ -n "$ERRS" ]; then
+              echo ">>> XRAY ERRORS:"
+              echo "$ERRS"
             fi
           done
