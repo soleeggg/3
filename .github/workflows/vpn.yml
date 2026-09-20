@@ -16,7 +16,7 @@ jobs:
           set +e
 
           UUID=$(cat /proc/sys/kernel/random/uuid)
-          WSPATH="/$(openssl rand -hex 8)"
+          XPATH="/$(openssl rand -hex 8)"
           PORT=8080
 
           mkdir -p /tmp/xray && cd /tmp/xray
@@ -26,41 +26,44 @@ jobs:
 
           cat > config.json <<EOF
           {
-            "log": {"loglevel": "debug", "access": "/tmp/xray/access.log", "error": "/tmp/xray/error.log"},
+            "log": {"loglevel": "info", "access": "/tmp/xray/access.log", "error": "/tmp/xray/error.log"},
             "inbounds": [{
               "listen": "127.0.0.1",
               "port": ${PORT},
               "protocol": "vless",
               "settings": {"clients": [{"id": "${UUID}"}], "decryption": "none"},
               "streamSettings": {
-                "network": "ws",
-                "wsSettings": {"path": "${WSPATH}"}
+                "network": "xhttp",
+                "xhttpSettings": {"path": "${XPATH}"}
               },
               "sniffing": {
                 "enabled": true,
-                "destOverride": ["http", "tls", "quic"],
-                "routeOnly": false
+                "destOverride": ["http", "tls", "quic"]
               }
             }],
             "outbounds": [
-              {"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv4"}},
-              {"protocol": "blackhole", "tag": "block"}
-            ],
-            "dns": {
-              "servers": ["1.1.1.1", "8.8.8.8"]
-            }
+              {"protocol": "freedom", "tag": "direct"}
+            ]
           }
           EOF
 
           nohup ./xray -c config.json >/tmp/xray/stdout.log 2>&1 &
           sleep 3
-          pgrep -f '/tmp/xray/xray' >/dev/null || { echo "!! xray упал"; cat /tmp/xray/stdout.log; exit 1; }
+
+          if ! pgrep -f '/tmp/xray/xray' >/dev/null; then
+            echo "!! xray упал"
+            echo "=== stdout.log ==="
+            cat /tmp/xray/stdout.log
+            echo "=== error.log ==="
+            cat /tmp/xray/error.log 2>/dev/null
+            exit 1
+          fi
+          echo "[ok] xray запущен, pid=$(pgrep -f '/tmp/xray/xray' | head -1)"
 
           curl -fsSL -o /tmp/cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x /tmp/cloudflared
 
-          # КЛЮЧЕВОЕ: --protocol http2 вместо дефолтного QUIC
           nohup /tmp/cloudflared tunnel --no-autoupdate \
             --protocol http2 \
             --edge-ip-version 4 \
@@ -74,8 +77,7 @@ jobs:
             exit 1
           fi
 
-          # fp=chrome + alpn=http/1.1 — не даём клиенту негоциировать h2 на CF
-          VLESS="vless://${UUID}@${CFHOST}:443?encryption=none&security=tls&sni=${CFHOST}&type=ws&host=${CFHOST}&path=${WSPATH}&fp=chrome&alpn=http%2F1.1#gh-${GITHUB_RUN_ID}"
+          VLESS="vless://${UUID}@${CFHOST}:443?encryption=none&security=tls&sni=${CFHOST}&type=xhttp&host=${CFHOST}&path=${XPATH}&mode=auto#gh-${GITHUB_RUN_ID}"
 
           echo
           echo "================================================================"
@@ -84,8 +86,9 @@ jobs:
           echo "${VLESS}"
           echo "================================================================"
           echo "  host:   ${CFHOST}"
-          echo "  path:   ${WSPATH}"
+          echo "  path:   ${XPATH}"
           echo "  uuid:   ${UUID}"
+          echo "  proto:  XHTTP"
           echo "  expire: $(date -u -d '+355 minutes' '+%Y-%m-%d %H:%M UTC')"
           echo "================================================================"
           echo
@@ -107,9 +110,8 @@ jobs:
             ELAPSED=$(( $(date +%s) - START ))
             printf '[heartbeat %02d] up=%dm  xray=%s cf=%s  %s\n' \
               "$N" "$((ELAPSED/60))" "$X" "$C" "$(date -u '+%H:%M:%S')"
-            # если клиент подключался — покажем последние строки access.log
-            if [ -f /tmp/xray/access.log ]; then
-              echo "--- access.log (last 5) ---"
-              tail -5 /tmp/xray/access.log
+            if [ -s /tmp/xray/access.log ]; then
+              echo "--- access.log (last 3) ---"
+              tail -3 /tmp/xray/access.log
             fi
           done
