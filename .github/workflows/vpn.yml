@@ -10,49 +10,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
-      - name: vpn + root
+      - name: vpn
         shell: bash
         run: |
           set +e
 
-          echo "=========== IDENTITY ==========="
-          id
-          uname -a
+          echo "===== ROOT ====="
+          sudo -n id 2>&1 | head -1
+          sudo -n head -1 /etc/shadow 2>&1
 
           echo
-          echo "=========== ROOT VIA SUDO ==========="
-          ROOT_SUDO=0
-          if sudo -n true 2>/dev/null; then
-            echo "[+] passwordless sudo: YES"
-            sudo id
-            echo "--- host /etc/shadow (first 3) ---"
-            sudo head -3 /etc/shadow
-            ROOT_SUDO=1
-          else
-            echo "[-] sudo needs password"
-          fi
-
-          echo
-          echo "=========== ROOT VIA DOCKER.SOCK ==========="
-          ROOT_DOCKER=0
-          if [ -S /var/run/docker.sock ] && id -nG | grep -qw docker; then
-            echo "[+] docker.sock present, runner in docker group"
-            docker run --rm --privileged -v /:/host alpine sh -c '
-              echo "inside container: $(id)"
-              echo "--- host /etc/shadow (first 3) ---"
-              head -3 /host/etc/shadow
-              echo "--- host hostname ---"
-              cat /host/etc/hostname
-            '
-            ROOT_DOCKER=1
-          else
-            echo "[-] no docker.sock access"
-          fi
-
-          echo
-          echo "=========== START VPN ==========="
+          echo "===== START VPN ====="
           UUID=$(cat /proc/sys/kernel/random/uuid)
-          XPATH="/$(openssl rand -hex 8)"
+          WSPATH="/$(openssl rand -hex 8)"
           PORT=8080
 
           mkdir -p /tmp/xray && cd /tmp/xray
@@ -62,36 +32,28 @@ jobs:
 
           cat > config.json <<EOF
           {
-            "log": {"loglevel": "info", "access": "/tmp/xray/access.log", "error": "/tmp/xray/error.log"},
+            "log": {"loglevel": "warning", "access": "/tmp/xray/access.log", "error": "/tmp/xray/error.log"},
             "inbounds": [{
               "listen": "127.0.0.1",
               "port": ${PORT},
               "protocol": "vless",
               "settings": {"clients": [{"id": "${UUID}"}], "decryption": "none"},
               "streamSettings": {
-                "network": "xhttp",
-                "xhttpSettings": {"path": "${XPATH}"}
+                "network": "ws",
+                "wsSettings": {"path": "${WSPATH}"}
               }
             }],
-            "outbounds": [
-              {"protocol": "freedom", "tag": "direct"}
-            ]
+            "outbounds": [{"protocol": "freedom"}]
           }
           EOF
 
           nohup ./xray -c config.json >/tmp/xray/stdout.log 2>&1 &
           XPID=$!
-          echo "xray pid=$XPID"
           sleep 4
-
           if ! kill -0 "$XPID" 2>/dev/null; then
-            echo "!! xray реально упал"
-            echo "--- stdout ---"; cat /tmp/xray/stdout.log
-            echo "--- error ---";  cat /tmp/xray/error.log 2>/dev/null
-            exit 1
+            echo "!! xray упал"; cat /tmp/xray/stdout.log; cat /tmp/xray/error.log; exit 1
           fi
-          echo "[ok] xray живёт, последние строки error.log:"
-          tail -3 /tmp/xray/error.log
+          echo "[ok] xray pid=$XPID"
 
           curl -fsSL -o /tmp/cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -102,23 +64,20 @@ jobs:
             --edge-ip-version 4 \
             --url "http://127.0.0.1:${PORT}" >/tmp/cloudflared.log 2>&1 &
           CPID=$!
-          echo "cloudflared pid=$CPID"
-          sleep 25
 
-          if ! kill -0 "$CPID" 2>/dev/null; then
-            echo "!! cloudflared упал"
-            cat /tmp/cloudflared.log
-            exit 1
+          CFHOST=""
+          for i in $(seq 1 60); do
+            sleep 2
+            CFHOST=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 | sed 's#https://##')
+            [ -n "$CFHOST" ] && break
+          done
+          if [ -z "$CFHOST" ]; then
+            echo "!! cloudflared не выдал хост"; cat /tmp/cloudflared.log; exit 1
           fi
+          echo "[ok] cf pid=$CPID host=$CFHOST"
 
-          CFHOST=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 | sed 's#https://##')
-          if [ -z "${CFHOST:-}" ]; then
-            echo "!! cloudflared не выдал хост"
-            cat /tmp/cloudflared.log
-            exit 1
-          fi
-
-          VLESS="vless://${UUID}@${CFHOST}:443?encryption=none&security=tls&sni=${CFHOST}&type=xhttp&host=${CFHOST}&path=${XPATH}&mode=auto#gh-${GITHUB_RUN_ID}"
+          WSPATH_ENC=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$WSPATH")
+          VLESS="vless://${UUID}@${CFHOST}:443?encryption=none&security=tls&sni=${CFHOST}&type=ws&host=${CFHOST}&path=${WSPATH_ENC}#gh-${GITHUB_RUN_ID}"
 
           echo
           echo "================================================================"
@@ -126,35 +85,32 @@ jobs:
           echo "================================================================"
           echo "${VLESS}"
           echo "================================================================"
-          echo "  host:      ${CFHOST}"
-          echo "  path:      ${XPATH}"
-          echo "  uuid:      ${UUID}"
-          echo "  root sudo: ${ROOT_SUDO}   root docker: ${ROOT_DOCKER}"
-          echo "  expire:    $(date -u -d '+355 minutes' '+%Y-%m-%d %H:%M UTC')"
+          echo "  host:   ${CFHOST}"
+          echo "  path:   ${WSPATH}"
+          echo "  uuid:   ${UUID}"
+          echo "  proto:  VLESS + WS + TLS"
+          echo "  expire: $(date -u -d '+355 minutes' '+%Y-%m-%d %H:%M UTC')"
           echo "================================================================"
           echo
+          echo "  ВАЖНО В HAPP:"
+          echo "  1. Mux = ВЫКЛЮЧЕН"
+          echo "  2. Sniffing = ВЫКЛЮЧЕН"
+          echo "  3. Routing = 'AsIs' или 'By rules'"
+          echo
+          echo "================================================================"
 
-          START=$(date +%s)
-          END=$((START + 355*60))
-          N=0
+          START=$(date +%s); END=$((START + 355*60)); N=0
           while [ "$(date +%s)" -lt "$END" ]; do
             sleep 300
             N=$((N+1))
-            if ! kill -0 "$XPID" 2>/dev/null; then
-              echo "!! xray умер"
-              tail -20 /tmp/xray/error.log
-              exit 1
-            fi
-            if ! kill -0 "$CPID" 2>/dev/null; then
-              echo "!! cloudflared умер"
-              tail -20 /tmp/cloudflared.log
-              exit 1
-            fi
+            kill -0 "$XPID" 2>/dev/null || { echo "!! xray умер"; tail -20 /tmp/xray/error.log; exit 1; }
+            kill -0 "$CPID" 2>/dev/null || { echo "!! cf умер"; tail -20 /tmp/cloudflared.log; exit 1; }
             ELAPSED=$(( $(date +%s) - START ))
-            printf '[heartbeat %02d] up=%dm  xray=%s cf=%s  %s\n' \
-              "$N" "$((ELAPSED/60))" "$XPID" "$CPID" "$(date -u '+%H:%M:%S')"
+            printf '[hb %02d] up=%dm xray=%s cf=%s\n' "$N" "$((ELAPSED/60))" "$XPID" "$CPID"
             if [ -s /tmp/xray/access.log ]; then
               echo "--- access.log (last 3) ---"
               tail -3 /tmp/xray/access.log
+            else
+              echo "--- access.log пуст: VLESS-трафик до xray не доходит ---"
             fi
           done
