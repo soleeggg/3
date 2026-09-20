@@ -16,10 +16,8 @@ jobs:
           set +e
 
           echo "===== ROOT ====="
-          sudo -n id 2>&1 | head -1
+          sudo -n id | head -1
 
-          echo
-          echo "===== START VPN ====="
           UUID=$(cat /proc/sys/kernel/random/uuid)
           WSPATH="/$(openssl rand -hex 8)"
           PORT=8080
@@ -29,14 +27,13 @@ jobs:
             https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -q xray.zip && chmod +x xray
 
-          # loglevel: debug — Xray пишет КАЖДОЕ соединение и каждую ошибку
+          # wsSettings с keepalive: каждые 20с пингуем, чтобы CF не счёл поток idle
           cat > config.json <<EOF
           {
             "log": {
-              "loglevel": "debug",
+              "loglevel": "info",
               "access": "/tmp/xray/access.log",
-              "error":  "/tmp/xray/error.log",
-              "dnsLog": true
+              "error":  "/tmp/xray/error.log"
             },
             "inbounds": [{
               "listen": "127.0.0.1",
@@ -45,10 +42,18 @@ jobs:
               "settings": {"clients": [{"id": "${UUID}"}], "decryption": "none"},
               "streamSettings": {
                 "network": "ws",
-                "wsSettings": {"path": "${WSPATH}"}
+                "wsSettings": {
+                  "path": "${WSPATH}",
+                  "heartbeatPeriod": 20
+                }
               }
             }],
-            "outbounds": [{"protocol": "freedom"}]
+            "outbounds": [
+              {"protocol": "freedom", "settings": {"domainStrategy": "UseIP"}}
+            ],
+            "policy": {
+              "levels": {"0": {"handshake": 4, "connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 2}}
+            }
           }
           EOF
 
@@ -62,11 +67,12 @@ jobs:
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x /tmp/cloudflared
 
-          # --loglevel debug у cloudflared — видно каждый HTTP-запрос от клиента
+          # QUIC + несколько HA-соединений + ретраи — resilience к дропам CF-края
           nohup /tmp/cloudflared tunnel --no-autoupdate \
-            --protocol http2 \
-            --edge-ip-version 4 \
-            --loglevel debug \
+            --protocol quic \
+            --ha-connections 4 \
+            --retries 10 \
+            --loglevel info \
             --url "http://127.0.0.1:${PORT}" >/tmp/cloudflared.log 2>&1 &
           CPID=$!
 
@@ -99,38 +105,18 @@ jobs:
 
           START=$(date +%s); END=$((START + 355*60)); N=0
           while [ "$(date +%s)" -lt "$END" ]; do
-            sleep 30
+            sleep 60
             N=$((N+1))
             kill -0 "$XPID" 2>/dev/null || { echo "!! xray умер"; tail -30 /tmp/xray/error.log; exit 1; }
             kill -0 "$CPID" 2>/dev/null || { echo "!! cf умер"; tail -30 /tmp/cloudflared.log; exit 1; }
 
             ELAPSED=$(( $(date +%s) - START ))
-            echo
-            echo "=========[hb $N] up=${ELAPSED}s $(date -u '+%H:%M:%S')========="
-
-            # ---- что видел Xray ----
+            ACC=$(wc -l < /tmp/xray/access.log 2>/dev/null || echo 0)
+            ERR_CLOSE=$(grep -c "1006\|use of closed" /tmp/xray/error.log 2>/dev/null || echo 0)
+            CF_RECONN=$(grep -c "Registered tunnel connection\|Retrying" /tmp/cloudflared.log 2>/dev/null || echo 0)
+            printf '[hb %02d] up=%dm  accepted=%s  1006_errors=%s  cf_reconnects=%s\n' \
+              "$N" "$((ELAPSED/60))" "$ACC" "$ERR_CLOSE" "$CF_RECONN"
             if [ -s /tmp/xray/access.log ]; then
-              echo ">>> XRAY ACCESS (клиент дошёл, Xray обрабатывает):"
-              tail -5 /tmp/xray/access.log
-            else
-              echo ">>> XRAY ACCESS: ПУСТО — трафик до Xray не доходит"
-            fi
-
-            # ---- что видел cloudflared ----
-            if [ -s /tmp/cloudflared.log ]; then
-              INCOMING=$(grep -iE 'GET /|POST /|websocket|ws=|ServeHTTP|http.*req|Incoming' /tmp/cloudflared.log | tail -3)
-              if [ -n "$INCOMING" ]; then
-                echo ">>> CLOUDFLARED — входящие запросы:"
-                echo "$INCOMING"
-              else
-                echo ">>> CLOUDFLARED: входящих запросов не было"
-              fi
-            fi
-
-            # ---- ошибки, если есть ----
-            ERRS=$(tail -20 /tmp/xray/error.log | grep -iE 'rejected|invalid|fail|error|warn' | tail -3)
-            if [ -n "$ERRS" ]; then
-              echo ">>> XRAY ERRORS:"
-              echo "$ERRS"
+              echo "  last: $(tail -1 /tmp/xray/access.log)"
             fi
           done
