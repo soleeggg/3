@@ -1,130 +1,147 @@
-name: vpn
+name: vpn-node
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: "0 */5 * * *"
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vpn-node
+  cancel-in-progress: true
 
 jobs:
-  vpn:
+  node:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 350
+    env:
+      RUN_MINUTES: "320"
+      WS_PATH: "/gh-vpn"
     steps:
-      - name: vpn
-        shell: bash
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install xray and cloudflared
         run: |
-          set +e
-
-          echo "===== ROOT ====="
-          sudo -n id | head -1
-
-          UUID=$(cat /proc/sys/kernel/random/uuid)
-          XPATH="/$(openssl rand -hex 8)"
-          PORT=8080
-
-          mkdir -p /tmp/xray && cd /tmp/xray
-          curl -fsSL -o xray.zip \
+          set -euo pipefail
+          mkdir -p bin
+          curl -fsSL -o /tmp/xray.zip \
             https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-          unzip -q xray.zip && chmod +x xray
+          unzip -q -o /tmp/xray.zip -d bin
+          curl -fsSL -o bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x bin/xray bin/cloudflared
+          ./bin/xray version
+          ./bin/cloudflared --version
 
-          # XHTTP packet-up: короткие POST'ы, CF их не дропает.
-          # xPaddingBytes + scMaxEachPostBytes — маскировка под обычный REST.
-          cat > config.json <<EOF
+      - name: Start xray
+        run: |
+          set -euo pipefail
+          UUID=$(cat /proc/sys/kernel/random/uuid)
+          echo "UUID=$UUID" >> "$GITHUB_ENV"
+
+          cat > xray.json <<EOF
           {
-            "log": {
-              "loglevel": "info",
-              "access": "/tmp/xray/access.log",
-              "error":  "/tmp/xray/error.log"
-            },
-            "inbounds": [{
-              "listen": "127.0.0.1",
-              "port": ${PORT},
-              "protocol": "vless",
-              "settings": {
-                "clients": [{"id": "${UUID}"}],
-                "decryption": "none"
-              },
-              "streamSettings": {
-                "network": "xhttp",
-                "xhttpSettings": {
-                  "path": "${XPATH}",
-                  "mode": "packet-up",
-                  "scMaxEachPostBytes": 1000000,
-                  "scMinPostsIntervalMs": 30,
-                  "xPaddingBytes": "100-1000"
+            "log": { "loglevel": "warning" },
+            "inbounds": [
+              {
+                "listen": "127.0.0.1",
+                "port": 10000,
+                "protocol": "vless",
+                "settings": {
+                  "clients": [ { "id": "$UUID" } ],
+                  "decryption": "none"
+                },
+                "streamSettings": {
+                  "network": "ws",
+                  "wsSettings": { "path": "$WS_PATH" }
                 }
               }
-            }],
+            ],
             "outbounds": [
-              {"protocol": "freedom", "settings": {"domainStrategy": "UseIP"}}
+              { "protocol": "freedom", "tag": "direct" },
+              { "protocol": "blackhole", "tag": "block" }
             ]
           }
           EOF
 
-          nohup ./xray -c config.json >/tmp/xray/stdout.log 2>&1 &
-          XPID=$!
-          sleep 4
-          kill -0 "$XPID" 2>/dev/null || { echo "!! xray упал"; cat /tmp/xray/stdout.log; cat /tmp/xray/error.log; exit 1; }
-          echo "[ok] xray pid=$XPID"
-          echo "--- xray error.log ---"
-          tail -5 /tmp/xray/error.log
+          nohup ./bin/xray run -c xray.json > xray.log 2>&1 &
+          echo $! > xray.pid
+          sleep 3
+          kill -0 "$(cat xray.pid)"
+          ss -ltn | grep 10000
 
-          curl -fsSL -o /tmp/cloudflared \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x /tmp/cloudflared
+      - name: Start cloudflared tunnel
+        run: |
+          set -euo pipefail
+          nohup ./bin/cloudflared tunnel --no-autoupdate --protocol http2 \
+            --url http://127.0.0.1:10000 > cf.log 2>&1 &
+          echo $! > cf.pid
 
-          nohup /tmp/cloudflared tunnel --no-autoupdate \
-            --protocol quic \
-            --ha-connections 4 \
-            --retries 10 \
-            --url "http://127.0.0.1:${PORT}" >/tmp/cloudflared.log 2>&1 &
-          CPID=$!
-
-          CFHOST=""
-          for i in $(seq 1 60); do
+          HOST=""
+          for _ in $(seq 1 60); do
+            HOST=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' cf.log | head -n1 || true)
+            [ -n "$HOST" ] && break
             sleep 2
-            CFHOST=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 | sed 's#https://##')
-            [ -n "$CFHOST" ] && break
           done
-          [ -z "$CFHOST" ] && { echo "!! cf не выдал хост"; tail -40 /tmp/cloudflared.log; exit 1; }
-          echo "[ok] cf pid=$CPID host=$CFHOST"
 
-          XPATH_ENC=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$XPATH")
+          if [ -z "$HOST" ]; then
+            echo "no tunnel hostname assigned"
+            tail -n 50 cf.log
+            exit 1
+          fi
 
-          # type=xhttp + mode=packet-up + extra-параметры паддинга
-          VLESS="vless://${UUID}@${CFHOST}:443?encryption=none&security=tls&sni=${CFHOST}&type=xhttp&host=${CFHOST}&path=${XPATH_ENC}&mode=packet-up&x_padding_bytes=100-1000#gh-${GITHUB_RUN_ID}"
+          HOST="${HOST#https://}"
+          echo "HOST=$HOST" >> "$GITHUB_ENV"
+          echo "tunnel host: $HOST"
 
-          echo
-          echo "================================================================"
-          echo "  HAPP — скопируй строку ниже"
-          echo "================================================================"
-          echo "${VLESS}"
-          echo "================================================================"
-          echo "  host:   ${CFHOST}"
-          echo "  path:   ${XPATH}"
-          echo "  uuid:   ${UUID}"
-          echo "  proto:  VLESS + XHTTP (packet-up) + TLS"
-          echo "  expire: $(date -u -d '+355 minutes' '+%Y-%m-%d %H:%M UTC')"
-          echo "================================================================"
-          echo "  В HAPP:"
-          echo "   - Transport = xhttp (не ws!)"
-          echo "   - Mode = packet-up"
-          echo "   - Mux = ВЫКЛ, Sniffing = ВЫКЛ, FP = chrome"
-          echo "================================================================"
-          echo
+      - name: Publish HAPP subscription
+        run: |
+          set -euo pipefail
+          ENC_PATH=$(printf '%s' "$WS_PATH" | sed 's|/|%2F|g')
+          LINK="vless://${UUID}@${HOST}:443?encryption=none&security=tls&sni=${HOST}&fp=chrome&type=ws&host=${HOST}&path=${ENC_PATH}#gh-actions-vpn"
+          printf '%s' "$LINK" | base64 -w0 > sub.txt
 
-          START=$(date +%s); END=$((START + 355*60)); N=0
+          RAW="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/sub.txt"
+          CDN="https://cdn.jsdelivr.net/gh/${GITHUB_REPOSITORY}@main/sub.txt"
+
+          {
+            echo "### VPN node up"
+            echo
+            echo '```'
+            echo "$LINK"
+            echo '```'
+            echo
+            echo "- Subscription (raw): $RAW"
+            echo "- Subscription (jsDelivr): $CDN"
+            echo "- Node lifetime: ${RUN_MINUTES} minutes from now"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice title=HAPP subscription::${RAW}"
+          echo "$LINK"
+
+      - name: Commit subscription
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sub.txt
+          git commit -m "vpn node $(date -u +%FT%TZ)" || echo "nothing to commit"
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Keep alive
+        run: |
+          set -euo pipefail
+          END=$(( $(date +%s) + RUN_MINUTES * 60 ))
           while [ "$(date +%s)" -lt "$END" ]; do
+            kill -0 "$(cat xray.pid)" 2>/dev/null || { echo "xray died"; tail -n 30 xray.log; exit 1; }
+            kill -0 "$(cat cf.pid)"   2>/dev/null || { echo "cloudflared died"; tail -n 30 cf.log; exit 1; }
             sleep 60
-            N=$((N+1))
-            kill -0 "$XPID" 2>/dev/null || { echo "!! xray умер"; tail -30 /tmp/xray/error.log; exit 1; }
-            kill -0 "$CPID" 2>/dev/null || { echo "!! cf умер"; tail -30 /tmp/cloudflared.log; exit 1; }
-
-            ELAPSED=$(( $(date +%s) - START ))
-            ACC=$(wc -l < /tmp/xray/access.log 2>/dev/null || echo 0)
-            ERRS=$(grep -c "1006\|closed\|EOF" /tmp/xray/error.log 2>/dev/null || echo 0)
-            CF_RECONN=$(grep -c "Retrying\|Registered" /tmp/cloudflared.log 2>/dev/null || echo 0)
-            printf '[hb %02d] up=%dm accepted=%s errors=%s cf_evt=%s\n' \
-              "$N" "$((ELAPSED/60))" "$ACC" "$ERRS" "$CF_RECONN"
-            [ -s /tmp/xray/access.log ] && echo "  last: $(tail -1 /tmp/xray/access.log)"
           done
+          echo "lifetime reached, exiting for the next scheduled run"
