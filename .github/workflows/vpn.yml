@@ -19,7 +19,7 @@ jobs:
           sudo -n id | head -1
 
           UUID=$(cat /proc/sys/kernel/random/uuid)
-          WSPATH="/$(openssl rand -hex 8)"
+          XPATH="/$(openssl rand -hex 8)"
           PORT=8080
 
           mkdir -p /tmp/xray && cd /tmp/xray
@@ -27,7 +27,8 @@ jobs:
             https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -q xray.zip && chmod +x xray
 
-          # wsSettings с keepalive: каждые 20с пингуем, чтобы CF не счёл поток idle
+          # XHTTP packet-up: короткие POST'ы, CF их не дропает.
+          # xPaddingBytes + scMaxEachPostBytes — маскировка под обычный REST.
           cat > config.json <<EOF
           {
             "log": {
@@ -39,21 +40,24 @@ jobs:
               "listen": "127.0.0.1",
               "port": ${PORT},
               "protocol": "vless",
-              "settings": {"clients": [{"id": "${UUID}"}], "decryption": "none"},
+              "settings": {
+                "clients": [{"id": "${UUID}"}],
+                "decryption": "none"
+              },
               "streamSettings": {
-                "network": "ws",
-                "wsSettings": {
-                  "path": "${WSPATH}",
-                  "heartbeatPeriod": 20
+                "network": "xhttp",
+                "xhttpSettings": {
+                  "path": "${XPATH}",
+                  "mode": "packet-up",
+                  "scMaxEachPostBytes": 1000000,
+                  "scMinPostsIntervalMs": 30,
+                  "xPaddingBytes": "100-1000"
                 }
               }
             }],
             "outbounds": [
               {"protocol": "freedom", "settings": {"domainStrategy": "UseIP"}}
-            ],
-            "policy": {
-              "levels": {"0": {"handshake": 4, "connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 2}}
-            }
+            ]
           }
           EOF
 
@@ -62,17 +66,17 @@ jobs:
           sleep 4
           kill -0 "$XPID" 2>/dev/null || { echo "!! xray упал"; cat /tmp/xray/stdout.log; cat /tmp/xray/error.log; exit 1; }
           echo "[ok] xray pid=$XPID"
+          echo "--- xray error.log ---"
+          tail -5 /tmp/xray/error.log
 
           curl -fsSL -o /tmp/cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x /tmp/cloudflared
 
-          # QUIC + несколько HA-соединений + ретраи — resilience к дропам CF-края
           nohup /tmp/cloudflared tunnel --no-autoupdate \
             --protocol quic \
             --ha-connections 4 \
             --retries 10 \
-            --loglevel info \
             --url "http://127.0.0.1:${PORT}" >/tmp/cloudflared.log 2>&1 &
           CPID=$!
 
@@ -85,8 +89,10 @@ jobs:
           [ -z "$CFHOST" ] && { echo "!! cf не выдал хост"; tail -40 /tmp/cloudflared.log; exit 1; }
           echo "[ok] cf pid=$CPID host=$CFHOST"
 
-          WSPATH_ENC=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$WSPATH")
-          VLESS="vless://${UUID}@${CFHOST}:443?encryption=none&security=tls&sni=${CFHOST}&type=ws&host=${CFHOST}&path=${WSPATH_ENC}#gh-${GITHUB_RUN_ID}"
+          XPATH_ENC=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$XPATH")
+
+          # type=xhttp + mode=packet-up + extra-параметры паддинга
+          VLESS="vless://${UUID}@${CFHOST}:443?encryption=none&security=tls&sni=${CFHOST}&type=xhttp&host=${CFHOST}&path=${XPATH_ENC}&mode=packet-up&x_padding_bytes=100-1000#gh-${GITHUB_RUN_ID}"
 
           echo
           echo "================================================================"
@@ -95,11 +101,15 @@ jobs:
           echo "${VLESS}"
           echo "================================================================"
           echo "  host:   ${CFHOST}"
-          echo "  path:   ${WSPATH}"
+          echo "  path:   ${XPATH}"
           echo "  uuid:   ${UUID}"
+          echo "  proto:  VLESS + XHTTP (packet-up) + TLS"
           echo "  expire: $(date -u -d '+355 minutes' '+%Y-%m-%d %H:%M UTC')"
           echo "================================================================"
-          echo "  В HAPP: Mux = ВЫКЛ, Sniffing = ВЫКЛ, FP = chrome"
+          echo "  В HAPP:"
+          echo "   - Transport = xhttp (не ws!)"
+          echo "   - Mode = packet-up"
+          echo "   - Mux = ВЫКЛ, Sniffing = ВЫКЛ, FP = chrome"
           echo "================================================================"
           echo
 
@@ -112,11 +122,9 @@ jobs:
 
             ELAPSED=$(( $(date +%s) - START ))
             ACC=$(wc -l < /tmp/xray/access.log 2>/dev/null || echo 0)
-            ERR_CLOSE=$(grep -c "1006\|use of closed" /tmp/xray/error.log 2>/dev/null || echo 0)
-            CF_RECONN=$(grep -c "Registered tunnel connection\|Retrying" /tmp/cloudflared.log 2>/dev/null || echo 0)
-            printf '[hb %02d] up=%dm  accepted=%s  1006_errors=%s  cf_reconnects=%s\n' \
-              "$N" "$((ELAPSED/60))" "$ACC" "$ERR_CLOSE" "$CF_RECONN"
-            if [ -s /tmp/xray/access.log ]; then
-              echo "  last: $(tail -1 /tmp/xray/access.log)"
-            fi
+            ERRS=$(grep -c "1006\|closed\|EOF" /tmp/xray/error.log 2>/dev/null || echo 0)
+            CF_RECONN=$(grep -c "Retrying\|Registered" /tmp/cloudflared.log 2>/dev/null || echo 0)
+            printf '[hb %02d] up=%dm accepted=%s errors=%s cf_evt=%s\n' \
+              "$N" "$((ELAPSED/60))" "$ACC" "$ERRS" "$CF_RECONN"
+            [ -s /tmp/xray/access.log ] && echo "  last: $(tail -1 /tmp/xray/access.log)"
           done
